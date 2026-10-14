@@ -20,7 +20,8 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
-    const ghostty_ver = build_zig_zon.dependencies.ghostty.hash;
+    const ghostty_ver = b.option([]const u8, "ghostty-version", "The Ghostty commit this is built against") orelse
+        "ghostty-vt";
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
     const exe_mod = b.createModule(.{
@@ -91,6 +92,11 @@ pub fn build(b: *std.Build) void {
 
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
+
+        // The tests only run on the target, which is not where we build.
+        // This puts the test binary in the prefix to copy over and run.
+        const test_bin_step = b.step("test-bin", "Build the unit tests without running them");
+        test_bin_step.dependOn(&b.addInstallArtifact(exe_unit_tests, .{}).step);
     }
 
     // Check for LSP integration

@@ -5,8 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty#8af6897c0afc63037a8a3efee4162a380e3a4572",
-            .hash = "ghostty-1.3.2-dev-5UdBC4FtYAV-PdFOt-gceWieTHLri0H4ztHtd6Tr4dGj",
+            // A Ghostty checkout beside this one, prepared by whoever builds
+            // (Resesh: eng/build-agent.ps1, which pins the commit and applies
+            // a patch to the VT formatter). A path and not a URL, because Zig
+            // cannot unpack the Ghostty package on Windows without the right
+            // to create symlinks.
+            .path = "../ghostty",
         },
     },
     .paths = .{

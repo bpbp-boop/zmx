@@ -26,6 +26,12 @@ pub const Tag = enum(u8) {
     EnvGet = 19,
     EnvSet = 20,
     EnvData = 21,
+    /// Asks for `StatData`: lines of `key=value` text about the daemon and
+    /// its session. New facts are new keys, and a reader skips the keys it
+    /// does not know, so this pair never needs another tag. A daemon from
+    /// before it ignores the request and sends nothing.
+    StatGet = 22,
+    StatData = 23,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -37,6 +43,14 @@ comptime {
         "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
     );
 }
+
+/// What this build speaks, sent as `protocol=` in `StatData`. Tags are never
+/// changed or reused, so this only says which additions a daemon has. Raise
+/// it when a client would otherwise have to guess.
+///
+/// 1: `StatGet`/`StatData`; the snapshot sent on attach is bracketed as a
+///    replay and followed by program status.
+pub const PROTOCOL = 1;
 
 pub const Header = packed struct {
     tag: Tag,
@@ -256,10 +270,13 @@ const SessionProbeResult = struct {
     fd: i32,
     info: Info,
     labels: ?[]const u8,
+    /// `StatData` as sent. Null from a daemon that predates it.
+    stat: ?[]const u8 = null,
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *const SessionProbeResult) void {
         if (self.labels) |lbl| self.alloc.free(lbl);
+        if (self.stat) |s| self.alloc.free(s);
         lib_posix.close(self.fd);
     }
 };
@@ -274,6 +291,9 @@ pub fn probeSession(
 
     send(fd, .Info, "") catch return error.Unexpected;
     send(fd, .LabelGet, "") catch {};
+    // Last, so that a daemon that does not answer it costs one short wait
+    // after everything else has arrived.
+    send(fd, .StatGet, "") catch {};
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
     const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
@@ -290,6 +310,8 @@ pub fn probeSession(
     var info_result: ?Info = null;
     var labels: ?[]const u8 = null;
     errdefer if (labels) |lbl| alloc.free(lbl);
+    var stat: ?[]const u8 = null;
+    errdefer if (stat) |s| alloc.free(s);
 
     while (true) {
         if (sb.next()) |msg| {
@@ -300,8 +322,11 @@ pub fn probeSession(
             if (msg.header.tag == .LabelData) {
                 labels = alloc.dupe(u8, msg.payload) catch null;
             }
+            if (msg.header.tag == .StatData and stat == null) {
+                stat = alloc.dupe(u8, msg.payload) catch null;
+            }
 
-            if (info_result != null and labels != null) break;
+            if (info_result != null and labels != null and stat != null) break;
             continue;
         }
 
@@ -317,6 +342,7 @@ pub fn probeSession(
             .fd = fd,
             .info = info,
             .labels = labels,
+            .stat = stat,
             .alloc = alloc,
         };
     }

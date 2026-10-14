@@ -3,6 +3,7 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
+const status = @import("status.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
@@ -12,6 +13,7 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -360,9 +362,18 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // This prevents fish from waiting 10s for unanswered queries.
                     // Only clients that sent .Init (a real zmx attach) count,
                     // not a `zmx run` tail-only client.
-                    if (!daemon.hasTerminalClient() and
-                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
-                    {
+                    const answer_queries = !daemon.hasTerminalClient() and
+                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX;
+
+                    // The program status reply goes first: a program sends
+                    // that query together with DA1 and takes a DA1 reply
+                    // that arrives first to mean it is unsupported.
+                    daemon.status.feed(
+                        gpa,
+                        buf[0..n],
+                        if (answer_queries) &daemon.pty_write_buf else null,
+                    );
+                    if (answer_queries) {
                         util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
                     }
 
@@ -491,7 +502,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData => {},
+                        .StatGet => daemon.handleStat(gpa, client, pty_fd),
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .StatData => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -598,6 +610,8 @@ pub const Daemon = struct {
     cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
     has_had_client: bool = false,
+    /// Program status reports (OSC 7501) to send again when a client attaches.
+    status: status.Memory = .{},
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_id: [4]u8 = undefined,
@@ -626,6 +640,7 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
+        self.status.deinit(gpa);
         gpa.free(self.socket_path);
     }
 
@@ -895,6 +910,8 @@ pub const Daemon = struct {
         // NOTE: for local dev only
         // std.log.debug("buffering pty input data={x}", .{payload});
 
+        if (util.isUserInput(payload)) self.status.input(gpa);
+
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(gpa, payload);
@@ -990,9 +1007,43 @@ pub const Daemon = struct {
                 const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
                 defer gpa.free(term_output);
                 defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
+
+                // The screen is old news: its prompt marks are of commands
+                // that ran earlier. These tell a terminal that knows the
+                // sequence (Resesh) so; any other ignores an unknown OSC.
+                // The end is only sent if the start was, and always then.
+                const replay_begin = "\x1b]7377;replay;state=begin\x1b\\";
+                const replay_end = "\x1b]7377;replay;state=end\x1b\\";
+                const bracketed = if (ipc.appendMessage(gpa, &client.write_buf, .Output, replay_begin))
+                    true
+                else |_|
+                    false;
                 ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
                     std.log.warn(
                         "failed to buffer terminal state for client err={s}",
+                        .{@errorName(err)},
+                    );
+                };
+                if (bracketed) {
+                    ipc.appendMessage(gpa, &client.write_buf, .Output, replay_end) catch |err| {
+                        std.log.warn(
+                            "failed to buffer replay end for client err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                }
+                client.has_pending_output = true;
+            }
+
+            // Status reports are not screen state, so they follow the snapshot.
+            var status_out: std.Io.Writer.Allocating = .init(gpa);
+            defer status_out.deinit();
+            self.status.replay(&status_out.writer) catch {};
+            const reports = status_out.writer.buffered();
+            if (reports.len > 0) {
+                ipc.appendMessage(gpa, &client.write_buf, .Output, reports) catch |err| {
+                    std.log.warn(
+                        "failed to buffer program status for client err={s}",
                         .{@errorName(err)},
                     );
                 };
@@ -1074,6 +1125,52 @@ pub const Daemon = struct {
         lib_posix.kill(-self.pid, lib_posix.SIG.KILL) catch |err| {
             std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
         };
+    }
+
+    /// Answers `StatGet`. See `ipc.Tag.StatGet` for the format.
+    ///
+    /// - `protocol`: `ipc.PROTOCOL`.
+    /// - `agent`: the version of the binary this daemon was started from.
+    /// - `fg`: the name of the program in the foreground of the terminal.
+    /// - `cwd`: the directory that program is in, as a path.
+    ///
+    /// `fg` and `cwd` are read from /proc, so only Linux sends them, and a
+    /// value that could not be read or holds a newline is left out.
+    pub fn handleStat(self: *Daemon, gpa: std.mem.Allocator, client: *Client, pty_fd: i32) void {
+        _ = self;
+        var buf: [std.fs.max_path_bytes + 512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        writer.print("protocol={d}\nagent={s}\n", .{ ipc.PROTOCOL, build_options.version }) catch {};
+
+        if (builtin.os.tag == .linux) foreground: {
+            var pgid: c_int = 0;
+            if (cross.c.ioctl(pty_fd, cross.c.TIOCGPGRP, &pgid) != 0 or pgid <= 0) break :foreground;
+            var path_buf: [64]u8 = undefined;
+            var value: [std.fs.max_path_bytes]u8 = undefined;
+
+            comm: {
+                const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pgid}) catch break :comm;
+                const fd = lib_posix.open(path, .{ .ACCMODE = .RDONLY }, 0) catch break :comm;
+                defer lib_posix.close(fd);
+                const n = lib_posix.read(fd, &value) catch break :comm;
+                const name = std.mem.trimEnd(u8, value[0..n], "\n");
+                if (name.len == 0 or std.mem.indexOfScalar(u8, name, '\n') != null) break :comm;
+                writer.print("fg={s}\n", .{name}) catch {};
+            }
+
+            const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cwd", .{pgid}) catch break :foreground;
+            const n = cross.c.readlink(path.ptr, &value, value.len);
+            if (n <= 0) break :foreground;
+            const dir = value[0..@intCast(n)];
+            if (std.mem.indexOfScalar(u8, dir, '\n') != null) break :foreground;
+            writer.print("cwd={s}\n", .{dir}) catch {};
+        }
+
+        ipc.appendMessage(gpa, &client.write_buf, .StatData, writer.buffered()) catch |err| {
+            std.log.warn("failed to buffer stat for client err={s}", .{@errorName(err)});
+            return;
+        };
+        client.has_pending_output = true;
     }
 
     pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {

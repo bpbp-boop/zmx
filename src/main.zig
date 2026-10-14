@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
     const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
 
     const cmd = args.next() orelse {
-        return list(gpa, io, &cfg, false);
+        return list(gpa, io, &cfg, false, false);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -70,11 +70,13 @@ pub fn main(init: std.process.Init) !void {
         return help(io);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "ls")) {
         var short = false;
+        var json = false;
         while (args.next()) |arg| {
             if (detectHelp(arg)) return help(io);
             if (std.mem.eql(u8, arg, "--short")) short = true;
+            if (std.mem.eql(u8, arg, "--json")) json = true;
         }
-        return list(gpa, io, &cfg, short);
+        return list(gpa, io, &cfg, short, json);
     } else if (std.mem.eql(u8, cmd, "get") or std.mem.eql(u8, cmd, "g")) {
         const sesh_name = args.next() orelse {
             return printError(io, "session name required (or run inside a zmx session)", .{});
@@ -515,7 +517,7 @@ fn help(io: std.Io) !void {
         \\  [p]rint <name> <text...>                    Inject text into session display
         \\  [wr]ite <name> <file_path>                  Write stdin to file_path through the session
         \\  [d]etach                                    Detach all clients (ctrl+\\ for current client)
-        \\  [l]ist|ls [--short]                         List active sessions
+        \\  [l]ist|ls [--short|--json]                  List active sessions
         \\  [g]et <name>                                Get session labels
         \\  set <name> k=v ...                          Set session labels (k= to remove)
         \\  [cl]ear <name>                              Clear all session labels
@@ -1022,7 +1024,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     std.process.exit(agg_exit_code);
 }
 
-fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
+fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool, json: bool) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
@@ -1035,7 +1037,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     }
 
     if (sessions.items.len == 0) {
-        if (short) return;
+        if (short or json) return;
         var errbuf: [4096]u8 = undefined;
         var stderr = std.Io.File.stderr().writer(io, &errbuf);
         try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
@@ -1046,6 +1048,12 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
 
     for (sessions.items) |session| {
+        if (json) {
+            try util.writeSessionJson(&stdout.interface, session);
+            try stdout.interface.flush();
+            continue;
+        }
+
         if (session.is_error) {
             try util.writeSessionLine(&stdout.interface, session, short, current_session);
             try stdout.interface.flush();

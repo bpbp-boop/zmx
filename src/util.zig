@@ -16,6 +16,8 @@ pub const SessionEntry = struct {
     cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     labels: ?[]const u8 = null,
+    /// `StatData` from the daemon, or null from one that predates it.
+    stat: ?[]const u8 = null,
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
@@ -25,6 +27,7 @@ pub const SessionEntry = struct {
         if (self.cmd) |cmd| alloc.free(cmd);
         if (self.cwd) |cwd| alloc.free(cwd);
         if (self.labels) |l| alloc.free(l);
+        if (self.stat) |s| alloc.free(s);
     }
 
     pub fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
@@ -96,6 +99,11 @@ pub fn get_session_entries(
             else
                 null;
 
+            const stat = if (result.stat) |s|
+                alloc.dupe(u8, s) catch null
+            else
+                null;
+
             try sessions.append(alloc, .{
                 .name = name,
                 .pid = result.info.pid,
@@ -105,6 +113,7 @@ pub fn get_session_entries(
                 .cmd = cmd,
                 .cwd = cwd,
                 .labels = labels,
+                .stat = stat,
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
@@ -943,6 +952,169 @@ pub fn serializeTerminal(
 
 /// Formats a session entry for list output (only the name when `short` is
 /// true), adding a prefix to indicate the current session, if there is one.
+/// One session as a JSON object on one line, for a program to read.
+///
+/// A session that answered has `name`, `pid`, `clients` and `created`, then
+/// what it could tell: `cmd`, `pwd` (as the program in the session last
+/// reported it, usually a file:// URL), `ended` and `exit_code` for a
+/// finished task, `labels`, and each key the daemon sent in `StatData`
+/// (see `Daemon.handleStat`), with `protocol` as a number. A daemon from
+/// before `StatData` has none of those keys, which is how to tell.
+///
+/// A session that did not answer has `name` and `error`.
+pub fn writeSessionJson(writer: *std.Io.Writer, session: SessionEntry) !void {
+    try writer.writeAll("{\"name\":");
+    try writeJsonString(writer, session.name);
+    if (session.is_error) {
+        try writer.writeAll(",\"error\":");
+        try writeJsonString(writer, session.error_name orelse "Unexpected");
+        try writer.writeAll("}\n");
+        return;
+    }
+
+    try writer.print(",\"pid\":{d},\"clients\":{d},\"created\":{d}", .{
+        session.pid orelse 0,
+        session.clients_len orelse 0,
+        session.created_at,
+    });
+    if (session.cmd) |cmd| {
+        try writer.writeAll(",\"cmd\":");
+        try writeJsonString(writer, cmd);
+    }
+    if (session.cwd) |pwd| {
+        try writer.writeAll(",\"pwd\":");
+        try writeJsonString(writer, pwd);
+    }
+    if (session.task_ended_at) |ended_at| {
+        if (ended_at > 0) {
+            try writer.print(",\"ended\":{d}", .{ended_at});
+            if (session.task_exit_code) |exit_code| {
+                try writer.print(",\"exit_code\":{d}", .{exit_code});
+            }
+        }
+    }
+    if (session.labels) |labels| {
+        try writer.writeAll(",\"labels\":{");
+        var kvs = label.LabelIterator.init(labels);
+        var first = true;
+        while (kvs.next()) |kv| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeJsonString(writer, kv.key);
+            try writer.writeByte(':');
+            try writeJsonString(writer, kv.value);
+        }
+        try writer.writeByte('}');
+    }
+    if (session.stat) |stat| {
+        var lines = std.mem.splitScalar(u8, stat, '\n');
+        while (lines.next()) |line| {
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = line[0..eq];
+            const value = line[eq + 1 ..];
+            // The keys above are this function's own.
+            if (key.len == 0 or isSessionJsonKey(key)) continue;
+            try writer.writeByte(',');
+            try writeJsonString(writer, key);
+            try writer.writeByte(':');
+            if (std.mem.eql(u8, key, "protocol") and isDigits(value)) {
+                try writer.writeAll(value);
+            } else {
+                try writeJsonString(writer, value);
+            }
+        }
+    }
+    try writer.writeAll("}\n");
+}
+
+fn isSessionJsonKey(key: []const u8) bool {
+    const own = [_][]const u8{ "name", "error", "pid", "clients", "created", "cmd", "pwd", "ended", "exit_code", "labels" };
+    for (own) |k| {
+        if (std.mem.eql(u8, key, k)) return true;
+    }
+    return false;
+}
+
+fn isDigits(value: []const u8) bool {
+    if (value.len == 0 or value.len > 9) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// Writes a JSON string. Bytes that are not valid UTF-8 (a path can hold
+/// any) become U+FFFD, so the line always parses.
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeByte('"');
+    var i: usize = 0;
+    while (i < value.len) {
+        const c = value[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                0...8, 11, 12, 14...0x1f, 0x7f => try writer.print("\\u{x:0>4}", .{c}),
+                else => try writer.writeByte(c),
+            }
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 0;
+        if (len > 1 and i + len <= value.len and std.unicode.utf8ValidateSlice(value[i..][0..len])) {
+            try writer.writeAll(value[i..][0..len]);
+            i += len;
+        } else {
+            try writer.writeAll("\u{fffd}");
+            i += 1;
+        }
+    }
+    try writer.writeByte('"');
+}
+
+test "writeSessionJson writes one object per session" {
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writeSessionJson(&writer, .{
+        .name = "s1",
+        .pid = 42,
+        .clients_len = 1,
+        .is_error = false,
+        .error_name = null,
+        .cmd = "bash -l",
+        .cwd = "file://host/home/a \"b\"",
+        .labels = null,
+        .stat = "protocol=1\nagent=0.8.1-resesh.1\nfg=vim\ncwd=/home/a\tb\xff\nname=spoof\nfuture=x\n",
+        .created_at = 1700000000,
+        .task_ended_at = 0,
+        .task_exit_code = 0,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"s1\",\"pid\":42,\"clients\":1,\"created\":1700000000," ++
+            "\"cmd\":\"bash -l\",\"pwd\":\"file://host/home/a \\\"b\\\"\"," ++
+            "\"protocol\":1,\"agent\":\"0.8.1-resesh.1\",\"fg\":\"vim\"," ++
+            "\"cwd\":\"/home/a\\tb\u{fffd}\",\"future\":\"x\"}\n",
+        writer.buffered(),
+    );
+
+    writer = .fixed(&buf);
+    try writeSessionJson(&writer, .{
+        .name = "gone",
+        .pid = null,
+        .clients_len = null,
+        .is_error = true,
+        .error_name = "Timeout",
+        .created_at = 0,
+        .task_ended_at = 0,
+        .task_exit_code = 1,
+    });
+    try std.testing.expectEqualStrings("{\"name\":\"gone\",\"error\":\"Timeout\"}\n", writer.buffered());
+}
+
 pub fn writeSessionLine(
     writer: *std.Io.Writer,
     session: SessionEntry,
